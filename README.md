@@ -87,17 +87,50 @@ because there is no shell — only a Rust interpreter with a controlled function
 
 User Query (natural language)
     ↓
-LangGraph ReAct Agent (AWS Bedrock / Claude)
+LangGraph ReAct Agent (Ollama / qwen3.6:27b)
     ↓
-ONE tool: execute_code(python_code: str)
+Step 1 — Discovery: agent calls get_service_schema(service_name) via AWS MCP server
+    → botocore service model returned (operation names + input shapes, condensed)
     ↓
-Agent writes Boto3 Python code to answer the query
+Step 2 — Code generation: agent writes Boto3 Python using exact signatures from schema
     ↓
-Monty sandbox executes — only allowlisted Boto3 calls go through
+Step 3 — Execution: agent calls execute_code(python_code) — lives in the agent, NOT in MCP
+    → Monty sandbox executes with pre-authenticated boto3.Session in allowlist
+    → Credentials come from MCP server (STS temporary tokens), never from agent env
     ↓
 Structured result returned to agent
     ↓
 Agent interprets and responds to user
+
+---
+
+## Tool Separation: Why execute_code Is Not in the MCP Server
+
+The MCP server is a cloud-specific discovery and auth layer. execute_code is cloud-agnostic.
+
+AWS MCP server tools (AWS-specific, read-only):
+  - get_service_schema(service_name) — botocore service model, condensed
+  - get_temp_credentials()           — STS short-lived tokens (never exposes long-lived creds)
+
+Agent tools (cloud-agnostic, live in LangGraph agent):
+  - execute_code(python_code)        — Monty sandbox, pre-authenticated session in allowlist
+
+This separation means adding Azure tomorrow requires only a new Azure MCP server.
+Zero changes to the agent. Zero changes to Monty. The execute_code tool stays identical.
+
+---
+
+## Authentication Flow
+
+Long-lived AWS credentials live exclusively in the MCP server environment.
+The agent never sees them.
+
+1. Agent calls get_temp_credentials() from AWS MCP server at session start
+2. MCP server calls AWS STS, returns short-lived access key + secret + session token
+3. Agent builds boto3.Session from those tokens
+4. Session is passed into Monty allowlist: {"session": boto3_session}
+5. LLM writes code using session.client("ec2") — credentials are never in generated code
+6. Tokens expire in 15–60 min; even if leaked, blast radius is minimal
 
 ---
 
@@ -106,53 +139,50 @@ Agent interprets and responds to user
 This project intentionally scopes to AWS + Boto3. But the architecture is designed
 with multi-cloud in mind from the start.
 
-The key insight: MCP servers are not just tool registries — they are the abstraction
-boundary between a unified agent and cloud-specific implementations. Each cloud gets
-its own MCP server that encapsulates its SDK, auth, and quirks. The agent and the
-sandbox remain unchanged.
+MCP servers are the abstraction boundary between a unified agent and cloud-specific
+implementations. Each cloud gets its own MCP server that encapsulates two things only:
+  1. API discovery  — service schemas, operation signatures, parameter types
+  2. Authentication — short-lived credentials via the cloud's STS equivalent
 
-The target multi-cloud architecture looks like this:
+The agent and Monty sandbox remain unchanged regardless of how many clouds are connected.
+
+The target multi-cloud architecture:
 
     User: "Find idle compute across all my clouds"
              ↓
     LangGraph Agent (one agent, one brain)
              ↓
-    LLM writes Python code
+    Discovery: agent queries whichever MCP servers are relevant
+             → AWS MCP:   get_service_schema(), get_temp_credentials()
+             → Azure MCP: get_service_schema(), get_temp_credentials()  [future]
+             → GCP MCP:   get_service_schema(), get_temp_credentials()  [future]
              ↓
-    Monty sandbox executes
+    LLM writes Python code using SDK signatures from the schema
              ↓
-    Code calls into → AWS MCP server   (Boto3 under the hood)
-                    → Azure MCP server (Azure SDK under the hood)
-                    → GCP MCP server   (google-cloud SDK under the hood)
+    execute_code → Monty sandbox (same sandbox, always, for every cloud)
 
-The LLM writes cloud-agnostic Python. Each MCP server handles credentials,
-rate limits, and SDK-specific behaviour for its cloud. You can add a new cloud
-by wiring in a new FastMCP server — zero changes to the agent or the sandbox.
+Adding a new cloud = wire in a new FastMCP server. Zero changes to the agent or Monty.
 
-This also solves the context bloat problem at multi-cloud scale: regardless of how
-many clouds are connected, the agent context carries exactly ONE tool schema —
-`execute_code`. The MCP servers are implementation detail, invisible to the LLM.
+Context at multi-cloud scale: the agent still carries exactly TWO tool schemas
+(get_service_schema, get_temp_credentials) per connected cloud. Never the full API surface.
 
-This is the correct separation of concerns:
-- Monty: secure execution runtime
-- MCP servers: cloud-specific portability contracts
+Separation of concerns:
+- Monty:          secure execution runtime (cloud-agnostic)
+- MCP servers:    cloud-specific discovery + auth contracts
 - LangGraph agent: orchestration and reasoning
-- LLM: code generation
-
-aws-code-agent proves this pattern works on AWS first. The architecture scales
-horizontally to any cloud that has a Python SDK.
+- LLM:            code generation
 
 ---
 
 ## Stack
 
 - Agent: LangGraph (ReAct loop)
-- LLM: AWS Bedrock (Claude or Nova)
+- LLM: Ollama / qwen3.6:27b (v1). AWS Bedrock (Claude or Nova) is the production target — swap via langchain-aws.
 - Code execution: pydantic-monty (Rust-based secure Python interpreter)
-- AWS SDK: Boto3
+- AWS SDK: Boto3 / botocore (service models shipped with SDK, no scraping)
 - MCP server: FastMCP (AWS only, v1)
 - API layer: FastAPI
-- Observability: Langfuse (OTel session tracing)
+- Observability: Langfuse (OTel session tracing) — deferred
 - Packaging: Docker Compose
 
 ---
