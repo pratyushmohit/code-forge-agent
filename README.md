@@ -1,6 +1,8 @@
 Project: code-forge-agent
 Repo: github.com/pratyushmohit/code-forge-agent
 
+> **Work in Progress** — architecture and core components are in place, but this project is actively being built. Not production-ready.
+
 ## Problem Statement
 
 Traditional agentic AI systems expose external APIs as predefined tools — each tool is a
