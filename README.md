@@ -134,6 +134,74 @@ The agent never sees them.
 
 ---
 
+## Production-Informed Safety Design
+
+Most demo projects implement none of this. The goal here was to build the right way from
+the start, even at personal scale. These features aren't compliance checkboxes — they're
+good engineering. Informed by real enterprise standards for agentic AI and MCP security,
+and by company SOPs I've worked with firsthand.
+
+### Autonomy Tiers
+
+Not all AWS operations carry the same risk. The agent operates in two modes:
+
+- **Read operations** execute automatically. `describe`, `list`, `get` — no confirmation
+  needed, no blast radius.
+- **Write and destructive operations** surface an explicit plan before anything runs. The
+  agent shows what it intends to do and why, and waits for confirmation before Monty executes.
+
+This maps to a real principle from enterprise agentic AI standards: execution permissions
+must be determined by policy, not by model instructions. The autonomy tier is set at deploy
+time. The LLM cannot promote itself to write access at runtime.
+
+### Dry-Run Preview
+
+For AWS operations that support it (EC2, CloudFormation, IAM, and others), the agent
+executes in `DryRun=True` mode first. The agent presents the preview result — what would
+have happened — and waits for human approval before the live call goes through.
+
+For high-impact or irreversible operations, this is not optional. You do not let an agent
+delete infrastructure without showing you exactly what it is about to delete.
+
+### Output Redaction
+
+Boto3 responses are verbose. They can surface account IDs, ARNs, environment variables,
+user data fields, and — if something is misconfigured upstream — plaintext credentials.
+None of that should enter LLM context raw.
+
+Before any Monty output reaches the agent's reasoning loop or gets written to logs, it
+passes through a redaction layer that scrubs known sensitive patterns. The LLM reasons
+about clean, minimized data — not raw API payloads.
+
+### Structured Audit Log
+
+Every execution writes an append-only record:
+- Timestamp
+- User-initiated query
+- Generated code (what the agent wrote)
+- Boto3 operations invoked
+- Outcome (success / error / blocked)
+
+This is not for compliance. It is for understanding what your agent actually did, being able
+to reconstruct any session, and catching drift in agent behavior over time.
+
+### Kill Switch
+
+A single environment variable or config flag drops the agent to read-only mode instantly —
+no redeployment, no downtime. Write operations are blocked at the policy layer. The agent
+continues to answer read queries.
+
+If something goes wrong, you want to be able to contain it in seconds, not minutes.
+
+### Bounded Execution
+
+The LangGraph ReAct loop has a hard ceiling on steps and a timeout per execution. An
+agent that loops indefinitely trying to self-correct a broken plan is not a feature — it is a
+runaway process consuming AWS API quota and potentially making repeated failed attempts
+at a destructive operation.
+
+---
+
 ## Architectural Vision: Why MCP Servers Are the Right Scaling Boundary
 
 This project intentionally scopes to AWS + Boto3. But the architecture is designed
